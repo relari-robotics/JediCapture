@@ -25,6 +25,7 @@
 		C0C52AAE287EC33D0011820F /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0C52AAD287EC33D0011820F /* AppState.swift */; };
 		ED0000000000000000000001 /* MotionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED0000000000000000000002 /* MotionManager.swift */; };
 		ED0000000000000000000003 /* VideoWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED0000000000000000000004 /* VideoWriter.swift */; };
+		ED0000000000000000000005 /* USBStreamer.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED0000000000000000000006 /* USBStreamer.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -61,6 +62,7 @@
 		C0C52AAD287EC33D0011820F /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		ED0000000000000000000002 /* MotionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MotionManager.swift; sourceTree = "<group>"; };
 		ED0000000000000000000004 /* VideoWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoWriter.swift; sourceTree = "<group>"; };
+		ED0000000000000000000006 /* USBStreamer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = USBStreamer.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -144,6 +146,7 @@
 				050A8EFB296E8B8E00C5C638 /* DDSWriter.swift */,
 				ED0000000000000000000002 /* MotionManager.swift */,
 				ED0000000000000000000004 /* VideoWriter.swift */,
+				ED0000000000000000000006 /* USBStreamer.swift */,
 			);
 			path = NeRFCapture;
 			sourceTree = "<group>";
@@ -264,6 +267,7 @@
 			files = (
 				ED0000000000000000000001 /* MotionManager.swift in Sources */,
 				ED0000000000000000000003 /* VideoWriter.swift in Sources */,
+				ED0000000000000000000005 /* USBStreamer.swift in Sources */,
 				C0C52AAA287EC2470011820F /* ARViewContainer.swift in Sources */,
 				050A8EFA296E738300C5C638 /* DatasetWriter.swift in Sources */,
 				C0C52A92287E7F940011820F /* ContentView.swift in Sources */,

@@ -23,6 +23,7 @@ set dotenv-load := true   # load JEDICAPTURE_TEAM (and friends) from ./.env
 
 scheme      := "NeRFCapture"
 config      := "Debug"
+usb_port    := "10080"   # must match USBStreamer.port in the app
 bundle_id   := "ai.relari.jedicapture"
 team        := env_var_or_default("JEDICAPTURE_TEAM", "2DFGSA53H4")
 build_dir   := "build"
@@ -88,6 +89,11 @@ install device: build
 # Build, install, and launch on the device.
 run device: (install device)
     xcrun devicectl device process launch --device {{device}} {{bundle_id}}
+
+# Tunnel the app's USB stream to localhost over usbmux (needs libimobiledevice).
+forward:
+    @command -v iproxy >/dev/null || { echo "iproxy not found — run: brew install libimobiledevice"; exit 1; }
+    iproxy {{usb_port}}:{{usb_port}}
 
 # Offload recorded session zips from the device over USB → ./pulled/.
 pull device:
