@@ -24,7 +24,14 @@ class ARViewModel : NSObject, ARSessionDelegate, ObservableObject {
     var cancellables = Set<AnyCancellable>()
     let datasetWriter: DatasetWriter
     let ddsWriter: DDSWriter
-    
+
+    // Continuous-capture throttle. ARKit delivers frames at up to 60 Hz; we
+    // subsample to a steady target so disk/encoding keeps up. Driven off the
+    // device-clock `frame.timestamp`, so capture-card-style drops just widen the
+    // next gap instead of compounding (same principle as the GoPro bridge).
+    var captureRateHz: Double = 30.0
+    private var lastCaptureTime: TimeInterval = 0
+
     init(datasetWriter: DatasetWriter, ddsWriter: DDSWriter) {
         self.datasetWriter = datasetWriter
         self.ddsWriter = ddsWriter
@@ -83,7 +90,15 @@ class ARViewModel : NSObject, ARSessionDelegate, ObservableObject {
         _ session: ARSession,
         didUpdate frame: ARFrame
     ) {
-//        frameSubject.send(frame)
+        // Continuous recording: while an Offline session is active, persist every
+        // frame at the target rate. No manual per-frame tap (that was NeRFCapture's
+        // snapshot workflow); a demo is one Start→End continuous take.
+        guard appState.appMode == .Offline,
+              datasetWriter.writerState == .SessionStarted else { return }
+        if frame.timestamp - lastCaptureTime >= 1.0 / captureRateHz {
+            lastCaptureTime = frame.timestamp
+            datasetWriter.writeFrameToDisk(frame: frame)
+        }
     }
     
     func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {

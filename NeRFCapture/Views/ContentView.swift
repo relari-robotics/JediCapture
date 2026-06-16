@@ -145,17 +145,12 @@ struct ContentView : View {
                             }
                             .buttonStyle(.bordered)
                             .buttonBorderShape(.capsule)
-                            Button(action: {
-                                if let frame = viewModel.session?.currentFrame {
-                                    viewModel.datasetWriter.writeFrameToDisk(frame: frame)
-                                }
-                            }) {
-                                Text("Save Frame")
-                                    .padding(.horizontal, 20)
-                                    .padding(.vertical, 5)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .buttonBorderShape(.capsule)
+                            // Continuous recording runs automatically between
+                            // Start and End — no per-frame tap. Just a status pill.
+                            Text("● REC")
+                                .foregroundColor(.red)
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 5)
                         }
                     }
                 }

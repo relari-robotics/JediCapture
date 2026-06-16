@@ -1,187 +1,155 @@
 //
 //  DatasetWriter.swift
-//  NeRFCapture
+//  JediCapture
 //
-//  Created by Jad Abou-Chakra on 11/1/2023.
+//  Continuous egocentric recorder. Between Start and End it persists, per frame:
+//    - RGB    → single HEVC video (rgb.mov)
+//    - depth  → lossless 16-bit mm PNG (depth/<i>.png)
+//    - pose+intrinsics+timestamp → frames.json
+//  and, for the whole session, 100 Hz IMU → imu.csv. All on one device clock.
 //
 
 import Foundation
 import ARKit
 import Zip
 
-extension UIImage {
-    func resizeImageTo(size: CGSize) -> UIImage? {
-        UIGraphicsBeginImageContextWithOptions(size, false, 0.0)
-        self.draw(in: CGRect(origin: CGPoint.zero, size: size))
-        let resizedImage = UIGraphicsGetImageFromCurrentImageContext()!
-        UIGraphicsEndImageContext()
-        return resizedImage
-    }
-}
-
 class DatasetWriter {
-    
+
     enum SessionState {
         case SessionNotStarted
         case SessionStarted
     }
-    
+
     var manifest = Manifest()
     var projectName = ""
     var projectDir = getDocumentsDirectory()
     var useDepthIfAvailable = true
-    
+    let motionManager = MotionManager()
+    private var videoWriter: VideoWriter?
+
     @Published var currentFrameCounter = 0
     @Published var writerState = SessionState.SessionNotStarted
-    
+
     func projectExists(_ projectDir: URL) -> Bool {
         var isDir: ObjCBool = true
         return FileManager.default.fileExists(atPath: projectDir.absoluteString, isDirectory: &isDir)
     }
-    
+
     func initializeProject() throws {
         let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "YYMMddHHmmss"
+        dateFormatter.dateFormat = "yyMMddHHmmss"
         projectName = dateFormatter.string(from: Date())
-        projectDir = getDocumentsDirectory()
-            .appendingPathComponent(projectName)
+        projectDir = getDocumentsDirectory().appendingPathComponent(projectName)
         if projectExists(projectDir) {
             throw AppError.projectAlreadyExists
         }
-        do {
-            try FileManager.default.createDirectory(at: projectDir.appendingPathComponent("images"), withIntermediateDirectories: true)
-        }
-        catch {
-            print(error)
-        }
-        
+        try FileManager.default.createDirectory(
+            at: projectDir.appendingPathComponent("depth"),
+            withIntermediateDirectories: true)
+
         manifest = Manifest()
-        
-        // The first frame will set these properly
-        manifest.w = 0
-        manifest.h = 0
-        
-        // These don't matter since every frame will redefine them
-        manifest.flX = 1.0
-        manifest.flY =  1.0
-        manifest.cx =  320
-        manifest.cy =  240
-        
-        manifest.depthIntegerScale = 1.0
+        videoWriter = nil               // created lazily on first frame (needs dims)
+        currentFrameCounter = 0
+        // IMU records continuously for the whole session; imu.csv device-clock
+        // timestamps align with each frame's `timestamp`.
+        motionManager.start(writingTo: projectDir.appendingPathComponent("imu.csv"))
         writerState = .SessionStarted
     }
-    
+
     func clean() {
-        guard case .SessionStarted = writerState else { return; }
+        motionManager.stop()
+        videoWriter = nil
+        guard case .SessionStarted = writerState else { return }
         writerState = .SessionNotStarted
         DispatchQueue.global().async {
-            do {
-                try FileManager.default.removeItem(at: self.projectDir)
-            }
-            catch {
-                print("Could not cleanup project files")
-            }
+            try? FileManager.default.removeItem(at: self.projectDir)
         }
     }
-    
+
     func finalizeProject(zip: Bool = true) {
+        motionManager.stop()
         writerState = .SessionNotStarted
-        let manifest_path = getDocumentsDirectory()
-            .appendingPathComponent(projectName)
-            .appendingPathComponent("transforms.json")
-        
-        writeManifestToPath(path: manifest_path)
-        DispatchQueue.global().async {
-            do {
-                if zip {
-                    let _ = try Zip.quickZipFiles([self.projectDir], fileName: self.projectName)
+        let dir = projectDir
+        let name = projectName
+        let manifestSnapshot = manifest
+
+        let writeManifestAndZip = {
+            self.writeManifest(manifestSnapshot, to: dir.appendingPathComponent("frames.json"))
+            DispatchQueue.global().async {
+                do {
+                    if zip { _ = try Zip.quickZipFiles([dir], fileName: name) }
+                    try FileManager.default.removeItem(at: dir)
+                } catch {
+                    print("Could not finalize/zip: \(error)")
                 }
-                try FileManager.default.removeItem(at: self.projectDir)
-            }
-            catch {
-                print("Could not zip")
             }
         }
+
+        // Zip only AFTER the video stream is flushed and closed.
+        if let vw = videoWriter {
+            vw.finish {
+                print("[video] finished: \(vw.appended) appended, \(vw.dropped) dropped")
+                writeManifestAndZip()
+            }
+            videoWriter = nil
+        } else {
+            writeManifestAndZip()
+        }
     }
-    
-    func getCurrentFrameName() -> String {
-        let frameName = String(currentFrameCounter)
-        return frameName
-    }
-    
-    func getFrameMetadata(_ frame: ARFrame, withDepth: Bool = false) -> Manifest.Frame {
-        let frameName = getCurrentFrameName()
-        let filePath = "images/\(frameName)"
-        let depthPath = "images/\(frameName).depth.png"
-        let manifest_frame = Manifest.Frame(
-            filePath: filePath,
-            depthPath: withDepth ? depthPath : nil,
-            transformMatrix: arrayFromTransform(frame.camera.transform),
-            timestamp: frame.timestamp,
-            flX:  frame.camera.intrinsics[0, 0],
-            flY:  frame.camera.intrinsics[1, 1],
-            cx:  frame.camera.intrinsics[2, 0],
-            cy:  frame.camera.intrinsics[2, 1],
-            w: Int(frame.camera.imageResolution.width),
-            h: Int(frame.camera.imageResolution.height)
-        )
-        return manifest_frame
-    }
-    
-    func writeManifestToPath(path: URL) {
+
+    func writeManifest(_ manifest: Manifest, to path: URL) {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
-        encoder.outputFormatting = .withoutEscapingSlashes
+        encoder.outputFormatting = [.withoutEscapingSlashes, .prettyPrinted]
         if let encoded = try? encoder.encode(manifest) {
-            do {
-                try encoded.write(to: path)
-            } catch {
-                print(error)
-            }
+            do { try encoded.write(to: path) } catch { print(error) }
         }
     }
-    
+
     func writeFrameToDisk(frame: ARFrame, useDepthIfAvailable: Bool = true) {
-        let frameName =  "\(getCurrentFrameName()).png"
-        let depthFrameName =  "\(getCurrentFrameName()).depth.png"
-        let baseDir = projectDir
-            .appendingPathComponent("images")
-        let fileName = baseDir
-            .appendingPathComponent(frameName)
-        let depthFileName = baseDir
-            .appendingPathComponent(depthFrameName)
-        
+        let idx = currentFrameCounter
+        let w = Int(frame.camera.imageResolution.width)
+        let h = Int(frame.camera.imageResolution.height)
+
+        // First frame fixes the RGB geometry + opens the video stream.
         if manifest.w == 0 {
-            manifest.w = Int(frame.camera.imageResolution.width)
-            manifest.h = Int(frame.camera.imageResolution.height)
-            manifest.flX =  frame.camera.intrinsics[0, 0]
-            manifest.flY =  frame.camera.intrinsics[1, 1]
-            manifest.cx =  frame.camera.intrinsics[2, 0]
-            manifest.cy =  frame.camera.intrinsics[2, 1]
+            manifest.w = w
+            manifest.h = h
+            manifest.flX = frame.camera.intrinsics[0, 0]
+            manifest.flY = frame.camera.intrinsics[1, 1]
+            manifest.cx = frame.camera.intrinsics[2, 0]
+            manifest.cy = frame.camera.intrinsics[2, 1]
+            videoWriter = VideoWriter(
+                url: projectDir.appendingPathComponent(manifest.video), width: w, height: h)
         }
-        
-        let useDepth = frame.sceneDepth != nil && useDepthIfAvailable
-        
-        let frameMetadata = getFrameMetadata(frame, withDepth: useDepth)
-        let rgbBuffer = pixelBufferToUIImage(pixelBuffer: frame.capturedImage)
-        let depthBuffer = useDepth ? pixelBufferToUIImage(pixelBuffer: frame.sceneDepth!.depthMap).resizeImageTo(size:  frame.camera.imageResolution) : nil
-        
-        DispatchQueue.global().async {
-            do {
-                let rgbData = rgbBuffer.pngData()
-                try rgbData?.write(to: fileName)
-                if useDepth {
-                    let depthData = depthBuffer!.pngData()
-                    try depthData?.write(to: depthFileName)
-                }
+
+        videoWriter?.append(frame.capturedImage, at: frame.timestamp)
+
+        var depthPath: String? = nil
+        if useDepthIfAvailable, let sd = frame.sceneDepth {
+            // Copy depth out synchronously (ARFrame owns the buffer briefly),
+            // then PNG-encode off the capture thread.
+            let (px, dw, dh) = extractDepthMillimeters(sd.depthMap)
+            if manifest.depthW == 0 { manifest.depthW = dw; manifest.depthH = dh }
+            let rel = "depth/\(idx).png"
+            let url = projectDir.appendingPathComponent(rel)
+            DispatchQueue.global(qos: .utility).async {
+                writeDepth16PNG(px, w: dw, h: dh, to: url)
             }
-            catch {
-                print(error)
-            }
-            DispatchQueue.main.async {
-                self.manifest.frames.append(frameMetadata)
-            }
+            depthPath = rel
         }
+
+        manifest.frames.append(
+            Manifest.Frame(
+                frameIndex: idx,
+                timestamp: frame.timestamp,
+                transformMatrix: arrayFromTransform(frame.camera.transform),
+                flX: frame.camera.intrinsics[0, 0],
+                flY: frame.camera.intrinsics[1, 1],
+                cx: frame.camera.intrinsics[2, 0],
+                cy: frame.camera.intrinsics[2, 1],
+                w: w, h: h,
+                depthPath: depthPath))
         currentFrameCounter += 1
     }
 }
