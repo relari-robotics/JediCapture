@@ -24,6 +24,7 @@ class ARViewModel : NSObject, ARSessionDelegate, ObservableObject {
     var cancellables = Set<AnyCancellable>()
     let datasetWriter: DatasetWriter
     let ddsWriter: DDSWriter
+    let usbStreamer = USBStreamer()
 
     // Continuous-capture throttle. ARKit delivers frames at up to 60 Hz; we
     // subsample to a steady target so disk/encoding keeps up. Driven off the
@@ -44,28 +45,23 @@ class ARViewModel : NSObject, ARSessionDelegate, ObservableObject {
         datasetWriter.$writerState.sink {x in self.appState.writerState = x} .store(in: &cancellables)
         datasetWriter.$currentFrameCounter.sink { x in self.appState.numFrames = x }.store(in: &cancellables)
         ddsWriter.$peers.sink {x in self.appState.ddsPeers = UInt32(x)}.store(in: &cancellables)
-        
+        usbStreamer.$clientConnected.receive(on: RunLoop.main)
+            .sink { [weak self] x in self?.appState.usbClientConnected = x }.store(in: &cancellables)
+        usbStreamer.$framesSent.receive(on: RunLoop.main)
+            .sink { [weak self] x in self?.appState.usbFrames = x }.store(in: &cancellables)
+
+        // The USB listener runs only while USB mode is selected; leaving the mode
+        // tears it down so the loopback port is free and IMU updates stop.
         $appState
             .map(\.appMode)
             .prepend(appState.appMode)
             .removeDuplicates()
-            .sink { x in
-                switch x {
-                case .Offline:
-//                    self.appState.stream = false
-                    print("Changed to offline")
-                case .Online:
-                    print("Changed to online")
-                }
+            .sink { [weak self] mode in
+                guard let self else { return }
+                if mode == .USB { self.usbStreamer.start() } else { self.usbStreamer.stop() }
+                print("Changed to \(mode)")
             }
             .store(in: &cancellables)
-        
-//        frameSubject.throttle(for: 0.5, scheduler: RunLoop.main, latest: true).sink {
-//            f in
-//            if self.appState.stream && self.appState.appMode == .Online {
-//                self.ddsWriter.writeFrameToTopic(frame: f)
-//            }
-//        }.store(in: &cancellables)
     }
     
     
@@ -90,14 +86,22 @@ class ARViewModel : NSObject, ARSessionDelegate, ObservableObject {
         _ session: ARSession,
         didUpdate frame: ARFrame
     ) {
-        // Continuous recording: while an Offline session is active, persist every
-        // frame at the target rate. No manual per-frame tap (that was NeRFCapture's
-        // snapshot workflow); a demo is one Start→End continuous take.
-        guard appState.appMode == .Offline,
-              datasetWriter.writerState == .SessionStarted else { return }
-        if frame.timestamp - lastCaptureTime >= 1.0 / captureRateHz {
-            lastCaptureTime = frame.timestamp
-            datasetWriter.writeFrameToDisk(frame: frame)
+        // One continuous take, subsampled to captureRateHz. Local records to the
+        // device; USB streams to the Mac; Wi-Fi (DDS) is driven by the Send button.
+        let due = frame.timestamp - lastCaptureTime >= 1.0 / captureRateHz
+        switch appState.appMode {
+        case .Local:
+            if datasetWriter.writerState == .SessionStarted, due {
+                lastCaptureTime = frame.timestamp
+                datasetWriter.writeFrameToDisk(frame: frame)
+            }
+        case .USB:
+            if usbStreamer.clientConnected, due {
+                lastCaptureTime = frame.timestamp
+                usbStreamer.sendFrame(frame)
+            }
+        case .WiFi:
+            break
         }
     }
     

@@ -45,10 +45,11 @@ struct ContentView : View {
                         HStack() {
                             Spacer()
                             Picker("Mode", selection: $viewModel.appState.appMode) {
-                                Text("Online").tag(AppMode.Online)
-                                Text("Offline").tag(AppMode.Offline)
+                                Text("Local").tag(AppMode.Local)
+                                Text("Wi-Fi").tag(AppMode.WiFi)
+                                Text("USB").tag(AppMode.USB)
                             }
-                            .frame(maxWidth: 200)
+                            .frame(maxWidth: 280)
                             .padding(0)
                             .pickerStyle(.segmented)
                             .disabled(viewModel.appState.writerState
@@ -62,15 +63,20 @@ struct ContentView : View {
                         
                         VStack(alignment:.leading) {
                             Text("\(viewModel.appState.trackingState)")
-                            if case .Online = viewModel.appState.appMode {
+                            if case .WiFi = viewModel.appState.appMode {
                                 Text("\(viewModel.appState.ddsPeers) Connection(s)")
                             }
-                            if case .Offline = viewModel.appState.appMode {
+                            if case .USB = viewModel.appState.appMode {
+                                Text(viewModel.appState.usbClientConnected
+                                     ? "USB: streaming \(viewModel.appState.usbFrames)"
+                                     : "USB: waiting for Mac")
+                            }
+                            if case .Local = viewModel.appState.appMode {
                                 if case .SessionStarted = viewModel.appState.writerState {
                                     Text("\(viewModel.datasetWriter.currentFrameCounter) Frames")
                                 }
                             }
-                            
+
                             if viewModel.appState.supportsDepth {
                                 Text("Depth Supported")
                             }
@@ -81,7 +87,7 @@ struct ContentView : View {
             VStack {
                 Spacer()
                 HStack(spacing: 20) {
-                    if case .Online = viewModel.appState.appMode {
+                    if case .WiFi = viewModel.appState.appMode {
                         Spacer()
                         Button(action: {
                             viewModel.resetWorldOrigin()
@@ -104,7 +110,24 @@ struct ContentView : View {
                         .buttonStyle(.borderedProminent)
                         .buttonBorderShape(.capsule)
                     }
-                    if case .Offline = viewModel.appState.appMode {
+                    if case .USB = viewModel.appState.appMode {
+                        Spacer()
+                        Button(action: {
+                            viewModel.resetWorldOrigin()
+                        }) {
+                            Text("Reset")
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 5)
+                        }
+                        .buttonStyle(.bordered)
+                        .buttonBorderShape(.capsule)
+                        // Streaming is automatic while a Mac is connected over USB.
+                        Text(viewModel.appState.usbClientConnected ? "● LIVE" : "○ waiting")
+                            .foregroundColor(viewModel.appState.usbClientConnected ? .red : .secondary)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 5)
+                    }
+                    if case .Local = viewModel.appState.appMode {
                         if viewModel.appState.writerState == .SessionNotStarted {
                             Spacer()
                             
