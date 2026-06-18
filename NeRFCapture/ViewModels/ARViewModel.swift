@@ -10,6 +10,7 @@ import Zip
 import Combine
 import ARKit
 import RealityKit
+import UIKit
 
 enum AppError : Error {
     case projectAlreadyExists
@@ -59,12 +60,29 @@ class ARViewModel : NSObject, ARSessionDelegate, ObservableObject {
             .sink { [weak self] mode in
                 guard let self else { return }
                 if mode == .USB { self.usbStreamer.start() } else { self.usbStreamer.stop() }
+                // Keep the screen awake while streaming over USB. iOS auto-lock
+                // suspends the app — pausing ARKit and tearing down the loopback
+                // socket — which silently drops the capture mid-recording (the
+                // Mac sees a clean EOF). Even with Auto-Lock = Never, Low Power
+                // Mode can force a lock, so we own this explicitly while live.
+                DispatchQueue.main.async {
+                    UIApplication.shared.isIdleTimerDisabled = (mode == .USB)
+                }
                 print("Changed to \(mode)")
             }
             .store(in: &cancellables)
     }
     
     
+    /// Re-arm the USB listener whenever the app returns to the foreground, so
+    /// opening the app *after* the Mac recorder already started just works (no
+    /// swipe-kill). Skip if we're already streaming, so a transient foreground
+    /// blip (e.g. a notification banner) never tears down a healthy connection.
+    func onForeground() {
+        guard appState.appMode == .USB, !appState.usbClientConnected else { return }
+        usbStreamer.start()
+    }
+
     func createARConfiguration() -> ARWorldTrackingConfiguration {
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity

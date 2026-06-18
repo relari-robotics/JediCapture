@@ -55,28 +55,75 @@ final class USBStreamer {
     private let maxPendingSends = 4     // drop frames if the link backs up
     var jpegQuality: CGFloat = 0.7
 
+    private var imuStarted = false      // guard against double CoreMotion subscribe
+    private var listenerShouldRun = false  // true between start()/stop(); gates auto-restart
+
+    /// (Re)arm the loopback listener. Safe to call repeatedly — on every USB-mode
+    /// select AND every time the app returns to the foreground. Launch order no
+    /// longer matters: start the Mac recorder first, then open the app, and the
+    /// fresh listener lets iproxy connect — no force-quit needed. A listener that
+    /// the OS tears down (backgrounding, resource reclaim) self-heals via the
+    /// stateUpdateHandler below instead of wedging until a swipe-kill.
     func start() {
+        listenerShouldRun = true
+        queue.async { [weak self] in self?.armListener() }
+        startIMU()
+    }
+
+    func stop() {
+        listenerShouldRun = false
+        motion.stopDeviceMotionUpdates()
+        imuStarted = false
+        queue.async { [weak self] in
+            self?.connection?.cancel(); self?.connection = nil
+            self?.listener?.cancel(); self?.listener = nil
+            self?.setConnected(false)
+        }
+        print("[usb] stopped")
+    }
+
+    /// Tear down any prior listener/connection and bind a fresh one. Runs on
+    /// `queue` so it never races adopt()/enqueue(), which also touch `listener`
+    /// and `connection`.
+    private func armListener() {
+        guard listenerShouldRun else { return }
+        connection?.cancel(); connection = nil
+        listener?.cancel()
+        setConnected(false)
+
         let params = NWParameters.tcp
         params.requiredInterfaceType = .loopback   // usbmux connects to device loopback
+        params.allowLocalEndpointReuse = true      // don't get stuck on a lingering bind
         guard let l = try? NWListener(
             using: params, on: NWEndpoint.Port(rawValue: USBStreamer.port)!) else {
-            print("[usb] failed to create listener on \(USBStreamer.port)")
+            print("[usb] failed to create listener on \(USBStreamer.port) — retrying in 1s")
+            queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.armListener() }
             return
         }
         listener = l
         l.newConnectionHandler = { [weak self] conn in self?.adopt(conn) }
-        l.stateUpdateHandler = { state in print("[usb] listener: \(state)") }
+        l.stateUpdateHandler = { [weak self] state in
+            print("[usb] listener: \(state)")
+            guard let self else { return }
+            switch state {
+            case .failed:
+                // A genuine listener failure (e.g. the OS reclaimed it) — recreate
+                // so the Mac can reconnect without a force-quit. We must NOT also
+                // re-arm on .cancelled: .cancelled is ALWAYS our own teardown
+                // (stop() or a restart), so re-arming on it would make every
+                // restart's cancel schedule another restart, tearing the listener
+                // down ~once a second and never letting a connection hold.
+                if self.listenerShouldRun {
+                    self.queue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        self?.armListener()
+                    }
+                }
+            default:
+                break
+            }
+        }
         l.start(queue: queue)
-        startIMU()
         print("[usb] listening on loopback:\(USBStreamer.port)")
-    }
-
-    func stop() {
-        motion.stopDeviceMotionUpdates()
-        connection?.cancel(); connection = nil
-        listener?.cancel(); listener = nil
-        setConnected(false)
-        print("[usb] stopped")
     }
 
     private func adopt(_ conn: NWConnection) {
@@ -149,7 +196,8 @@ final class USBStreamer {
     // MARK: - IMU
 
     private func startIMU() {
-        guard motion.isDeviceMotionAvailable else { return }
+        guard motion.isDeviceMotionAvailable, !imuStarted else { return }
+        imuStarted = true
         motion.deviceMotionUpdateInterval = 1.0 / 100.0
         motion.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: OperationQueue()) {
             [weak self] dm, _ in

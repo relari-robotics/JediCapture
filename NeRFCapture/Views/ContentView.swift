@@ -8,12 +8,13 @@
 import SwiftUI
 import ARKit
 import RealityKit
+import UIKit
 
 
 struct ContentView : View {
     @StateObject private var viewModel: ARViewModel
     @State private var showSheet: Bool = false
-    
+
     init(viewModel vm: ARViewModel) {
         _viewModel = StateObject(wrappedValue: vm)
     }
@@ -180,6 +181,12 @@ struct ContentView : View {
                 .padding()
             }
             .preferredColorScheme(.dark)
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didBecomeActiveNotification)) { _ in
+            // Returning to the foreground re-arms the USB listener so the Mac
+            // recorder can connect regardless of launch order — no swipe-kill.
+            viewModel.onForeground()
         }
     }
 }
