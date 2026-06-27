@@ -53,6 +53,13 @@ final class USBStreamer {
     private var frameIndex = 0          // session-thread only
     private var pendingSends = 0        // streamer-queue only
     private let maxPendingSends = 4     // drop frames if the link backs up
+    // Bounds how many ARFrame pixel buffers we hold for off-thread encoding.
+    // The JPEG/depth encode is expensive and must NOT run on the ARSession
+    // (main) thread — doing so stalled the live preview and capture. We hand it
+    // to `queue` instead, but each in-flight encode retains an ARKit capturedImage
+    // buffer; ARKit pools those, so holding too many starves it and stalls frame
+    // delivery. A small bound (drop when saturated) keeps capture smooth.
+    private let encodeSlots = DispatchSemaphore(value: 2)
     var jpegQuality: CGFloat = 0.7
 
     private var imuStarted = false      // guard against double CoreMotion subscribe
@@ -149,42 +156,57 @@ final class USBStreamer {
 
     // MARK: - Frame
 
-    /// Encode + enqueue one frame. Call synchronously from the ARSession thread
-    /// (the ARFrame owns its pixel buffers only briefly); the socket send itself
-    /// runs async on the streamer queue.
+    /// Snapshot the (cheap) per-frame metadata + retain the pixel buffers on the
+    /// ARSession thread, then do the EXPENSIVE JPEG/depth encode async on the
+    /// streamer queue so the AR/main thread returns immediately (a synchronous
+    /// encode here stalled the live preview and dropped capture to a few fps).
+    /// `encodeSlots` bounds how many ARKit buffers we hold; when encoders are
+    /// saturated we drop the frame rather than block the session or starve
+    /// ARKit's capturedImage pool.
     func sendFrame(_ frame: ARFrame) {
-        guard clientConnected, let jpeg = jpegData(frame.capturedImage) else { return }
+        guard clientConnected else { return }
+        // Non-blocking acquire — saturated ⇒ drop this frame (don't stall ARKit).
+        guard encodeSlots.wait(timeout: .now()) == .success else { return }
 
-        var depthData = Data()
-        var depthW: UInt32 = 0, depthH: UInt32 = 0
-        var hasDepth: UInt8 = 0
-        if let sd = frame.sceneDepth {
-            let (px, dw, dh) = extractDepthMillimeters(sd.depthMap)
-            depthData = px.withUnsafeBytes { Data($0) }
-            depthW = UInt32(dw); depthH = UInt32(dh); hasDepth = 1
-        }
-
+        let pixelBuffer = frame.capturedImage       // CVPixelBuffer — retained by the closure
+        let depthMap = frame.sceneDepth?.depthMap
         let idx = UInt32(frameIndex)
         frameIndex += 1
-
-        var p = Data()
-        p.appendLE(idx)
-        p.appendLE(frame.timestamp)
+        let timestamp = frame.timestamp
         let k = frame.camera.intrinsics
-        p.appendLE(k[0, 0]); p.appendLE(k[1, 1]); p.appendLE(k[2, 0]); p.appendLE(k[2, 1])
-        p.appendLE(UInt32(frame.camera.imageResolution.width))
-        p.appendLE(UInt32(frame.camera.imageResolution.height))
+        let res = frame.camera.imageResolution
         let t = frame.camera.transform
-        for col in [t.columns.0, t.columns.1, t.columns.2, t.columns.3] {
-            p.appendLE(col.x); p.appendLE(col.y); p.appendLE(col.z); p.appendLE(col.w)
-        }
-        p.append(hasDepth)
-        p.appendLE(depthW); p.appendLE(depthH); p.appendLE(Float(0.001))
-        p.appendLE(UInt32(jpeg.count)); p.append(jpeg)
-        p.appendLE(UInt32(depthData.count)); p.append(depthData)
 
-        enqueue(type: 0, payload: p, droppable: true)
-        DispatchQueue.main.async { self.framesSent = Int(idx) + 1 }
+        queue.async { [weak self] in
+            defer { self?.encodeSlots.signal() }
+            guard let self, let jpeg = self.jpegData(pixelBuffer) else { return }
+
+            var depthData = Data()
+            var depthW: UInt32 = 0, depthH: UInt32 = 0
+            var hasDepth: UInt8 = 0
+            if let depthMap {
+                let (px, dw, dh) = extractDepthMillimeters(depthMap)
+                depthData = px.withUnsafeBytes { Data($0) }
+                depthW = UInt32(dw); depthH = UInt32(dh); hasDepth = 1
+            }
+
+            var p = Data()
+            p.appendLE(idx)
+            p.appendLE(timestamp)
+            p.appendLE(k[0, 0]); p.appendLE(k[1, 1]); p.appendLE(k[2, 0]); p.appendLE(k[2, 1])
+            p.appendLE(UInt32(res.width))
+            p.appendLE(UInt32(res.height))
+            for col in [t.columns.0, t.columns.1, t.columns.2, t.columns.3] {
+                p.appendLE(col.x); p.appendLE(col.y); p.appendLE(col.z); p.appendLE(col.w)
+            }
+            p.append(hasDepth)
+            p.appendLE(depthW); p.appendLE(depthH); p.appendLE(Float(0.001))
+            p.appendLE(UInt32(jpeg.count)); p.append(jpeg)
+            p.appendLE(UInt32(depthData.count)); p.append(depthData)
+
+            self.sendOnQueue(type: 0, payload: p, droppable: true)
+            DispatchQueue.main.async { self.framesSent = Int(idx) + 1 }
+        }
     }
 
     private func jpegData(_ pb: CVPixelBuffer) -> Data? {
@@ -215,19 +237,26 @@ final class USBStreamer {
 
     // MARK: - Send
 
+    /// Dispatch onto `queue` then send. For callers NOT already on `queue` (IMU).
     private func enqueue(type: UInt8, payload: Data, droppable: Bool) {
         queue.async { [weak self] in
-            guard let self, let conn = self.connection else { return }
-            if droppable && self.pendingSends >= self.maxPendingSends { return }
-            var msg = Data()
-            msg.append(type)
-            msg.appendLE(UInt32(payload.count))
-            msg.append(payload)
-            self.pendingSends += 1
-            conn.send(content: msg, completion: .contentProcessed { [weak self] _ in
-                self?.queue.async { self?.pendingSends -= 1 }
-            })
+            self?.sendOnQueue(type: type, payload: payload, droppable: droppable)
         }
+    }
+
+    /// Frame + send the payload. MUST be called on `queue` (sendFrame's encode
+    /// block already runs there, so it calls this directly — no extra hop).
+    private func sendOnQueue(type: UInt8, payload: Data, droppable: Bool) {
+        guard let conn = connection else { return }
+        if droppable && pendingSends >= maxPendingSends { return }
+        var msg = Data()
+        msg.append(type)
+        msg.appendLE(UInt32(payload.count))
+        msg.append(payload)
+        pendingSends += 1
+        conn.send(content: msg, completion: .contentProcessed { [weak self] _ in
+            self?.queue.async { self?.pendingSends -= 1 }
+        })
     }
 }
 
